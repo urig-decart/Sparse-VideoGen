@@ -146,8 +146,15 @@ class WanTransformer3DModel_Sparse(WanTransformer3DModel):
 
         if ENABLE_FAST_KERNEL:
             # Required for Sparse VideoGen Fast RoPE
-            rot_real = rotary_emb.real.squeeze(0).squeeze(0).contiguous().to(torch.float32)
-            rot_imag = rotary_emb.imag.squeeze(0).squeeze(0).contiguous().to(torch.float32)
+            # diffusers >=0.37 returns (cos, sin) tuple; older versions return complex tensor
+            if isinstance(rotary_emb, tuple):
+                # diffusers >=0.37: (cos, sin) each shaped (1, seq_len, 1, head_dim)
+                # with repeat_interleave_real=True: [c0,c0,c1,c1,...] -> take ::2 for half_head_dim
+                rot_real = rotary_emb[0].squeeze(0).squeeze(1)[:, ::2].contiguous().to(torch.float32)
+                rot_imag = rotary_emb[1].squeeze(0).squeeze(1)[:, ::2].contiguous().to(torch.float32)
+            else:
+                rot_real = rotary_emb.real.squeeze(0).squeeze(0).contiguous().to(torch.float32)
+                rot_imag = rotary_emb.imag.squeeze(0).squeeze(0).contiguous().to(torch.float32)
             rotary_emb = (rot_real, rot_imag)
 
         hidden_states = self.patch_embedding(hidden_states)
