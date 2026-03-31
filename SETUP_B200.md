@@ -62,15 +62,25 @@ Edit `svg/kernels/CMakeLists.txt`, line 8:
 
 This changes the target from H100 (sm_90a) to B200 (sm_100a).
 
-### 7. Apply FlashInfer patch (block sparse attention)
+### 7. Install FlashInfer 0.6.7 (native Blackwell support)
+
+FlashInfer 0.6.7 has native sm_100 JIT kernels, replacing the old patched 0.2.10.
+No need to apply `modifications.patch` — the upstream 0.6.7 handles block-sparse attention natively.
+
+> **PERFORMANCE**: This is the single biggest B200 optimization. FlashInfer 0.6.7 turns
+> sparse attention from break-even (~1.0x) to **1.76-1.78x faster** than dense on 720p.
 
 ```bash
-cd svg/kernels/3rdparty/flashinfer
-cp ../../../../assets/patches/modifications.patch ./
-git apply modifications.patch
-pip install --no-build-isolation --editable .
-cd ../../../..
+pip install flashinfer-python==0.6.7 --no-build-isolation
 ```
+
+> **NOTE**: This will downgrade torch to 2.9.1 as a side effect. Restore it after:
+> ```bash
+> pip install torch==2.11.0
+> pip install 'nvidia-nccl-cu12>=2.29'
+> ```
+> The nccl fix is needed because FlashInfer 0.6.7 installs nccl 2.27 which is
+> incompatible with torch 2.11.0 (`ncclDevCommDestroy` symbol missing).
 
 ### 8. Build custom kernels
 
@@ -120,9 +130,9 @@ pip install diffusers==0.37.0
 > (`FLAX_WEIGHTS_NAME` was removed). 0.37.0 works but changes the rotary embedding
 > format, which requires the code patches below.
 
-### 12. Patch SVG code for diffusers 0.37+ and B200
+### 12. Patch SVG code for diffusers 0.37+, FlashInfer 0.6.7, and B200
 
-Three files need patching:
+Four files need patching:
 
 **a) `svg/models/wan/custom_models.py`** — RoPE format change
 
@@ -163,6 +173,36 @@ Same bug as the RMSNorm fix in commit `28a1a9b`. Both `_layer_norm_param_fwd_fus
 4. Use `row_mask` for Mean/Rstd stores
 5. Pass `M` from the Python caller
 
+**c) `svg/kmeans_utils.py`** — FlashInfer 0.6.7 API change
+
+FlashInfer 0.6.7 removed `_vector_sparse_indptr_buffer` and `_vector_sparse_indices_buffer`
+from `VariableBlockSparseAttentionWrapper`. The `reset_workspace_buffer` method now only
+accepts `float_workspace_buffer` and `int_workspace_buffer`. The wrapper manages sparse
+index buffers internally during `plan()`.
+
+In `dynamic_block_sparse_fwd_flashinfer` (~line 1358), replace:
+
+```python
+# OLD:
+float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
+vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
+wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+wrapper.reset_workspace_buffer(
+    float_workspace_buffer=wrapper._float_workspace_buffer,
+    int_workspace_buffer=wrapper._int_workspace_buffer,
+    vector_sparse_indices_buffer=vector_sparse_indices_buffer,
+    vector_sparse_indptr_buffer=wrapper._vector_sparse_indptr_buffer,
+)
+```
+
+with:
+
+```python
+# NEW:
+float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
+wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+```
+
 ## Changes from upstream
 
 | File | Change | Why |
@@ -170,8 +210,11 @@ Same bug as the RMSNorm fix in commit `28a1a9b`. Both `_layer_norm_param_fwd_fus
 | `svg/kernels/CMakeLists.txt` | `CMAKE_CUDA_ARCHITECTURES` 90a → 100a | Target B200 sm_100 instead of H100 sm_90 |
 | `svg/models/wan/custom_models.py` | Handle tuple rotary_emb + de-interleave | diffusers 0.37+ changed RoPE return format |
 | `svg/kernels/triton/layernorm.py` | Add row masking to both LayerNorm kernels | Prevent CUDA illegal memory access on B200 |
+| `svg/kmeans_utils.py` | Remove `reset_workspace_buffer` with old buffer args | FlashInfer 0.6.7 manages sparse buffers internally |
 
-The FlashInfer patch (`assets/patches/modifications.patch`) is already part of the repo — it just needs to be applied to the submodule.
+With FlashInfer 0.6.7, the old `assets/patches/modifications.patch` is no longer needed —
+0.6.7 handles block-sparse attention natively with Blackwell-optimized kernels.
+SVG's runtime monkey-patch (`svg/flashinfer_patch.py`, from PR #71) auto-applies on import.
 
 ## Final package versions
 
@@ -180,7 +223,7 @@ The FlashInfer patch (`assets/patches/modifications.patch`) is already part of t
 | Python | 3.11.15 |
 | PyTorch | 2.11.0+cu130 |
 | torchvision | 0.26.0 |
-| FlashInfer | 0.2.10 (patched, editable) |
+| FlashInfer | 0.6.7 (native Blackwell sm_100 JIT) |
 | flash-attn | 2.8.3 (compiled from source) |
 | diffusers | 0.37.0 |
 | transformers | 5.3.0 |

@@ -167,6 +167,28 @@ pip install 'imageio[pyav]'
 
 ## Reference results (B200, Wan2.1-1.3B, 720p, 81 frames)
 
+### With FlashInfer 0.6.7 (recommended)
+
+```
+Prompt  Dense      SVG         SAP         SVG spdup   SAP spdup
+------------------------------------------------------------------------
+p000    333.6s     213.0s      189.5s      1.56x       1.75x
+p001    333.3s     166.1s      190.6s      2.00x       1.74x
+p002    332.8s     180.2s      187.5s      1.84x       1.77x
+------------------------------------------------------------------------
+AVG     333.2s     186.4s      189.2s      1.78x       1.76x
+
+Prompt  SVG PSNR   SVG SSIM    SAP PSNR    SAP SSIM
+----------------------------------------------------
+p000    28.4 dB    0.9880      31.1 dB     0.9936
+p001    25.6 dB    0.9773      30.9 dB     0.9931
+p002    24.2 dB    0.9306      27.4 dB     0.9673
+----------------------------------------------------
+AVG     26.1 dB    0.9653      29.8 dB     0.9847
+```
+
+### With FlashInfer 0.2.10 (old, archived in results/archive/)
+
 ```
 Prompt  Dense      SVG         SAP         SVG spdup   SAP spdup
 ------------------------------------------------------------------------
@@ -175,20 +197,22 @@ p001    175.5s     130.1s      153.1s      1.34x       1.14x
 p002    144.4s     127.4s      148.8s      1.13x       0.97x
 ------------------------------------------------------------------------
 AVG     187.1s     183.0s      188.5s      1.02x       0.99x
-
-Prompt  SVG PSNR   SVG SSIM    SAP PSNR    SAP SSIM
-----------------------------------------------------
-p000    28.1 dB    0.9873      30.5 dB     0.9928
-p001    26.1 dB    0.9793      28.4 dB     0.9878
-p002    24.1 dB    0.9294      26.9 dB     0.9626
-----------------------------------------------------
-AVG     26.1 dB    0.9653      28.6 dB     0.9811
 ```
 
+### FlashInfer upgrade impact
+
+| Metric | FI 0.2.10 | FI 0.6.7 | Improvement |
+|--------|-----------|----------|-------------|
+| SVG avg speedup vs dense | 1.02x | **1.78x** | +74% |
+| SAP avg speedup vs dense | 0.99x | **1.76x** | +78% |
+| SAP avg PSNR | 28.6 dB | **29.8 dB** | +1.2 dB |
+| SAP avg SSIM | 0.9811 | **0.9847** | +0.004 |
+
 **Notes**:
-- p000 is slower due to Triton JIT compilation warmup on first run
-- SVG (striped) has less overhead than SAP (k-means), slightly faster
-- SAP produces higher quality output (PSNR 28.6 vs 26.1, SSIM 0.98 vs 0.97)
+- FlashInfer 0.6.7 has native Blackwell sm_100 JIT kernels — this is the single biggest B200 optimization
+- SVG (striped) and SAP (k-means) both achieve ~1.77x speedup over dense
+- SVG is slightly faster on average (186s vs 189s) with lower overhead
+- SAP produces higher quality output (PSNR 29.8 vs 26.1, SSIM 0.98 vs 0.97)
 - Sparse methods benefit more from the 14B model (40 heads) where attention is a larger fraction of compute
 - All runs use seed=42 for reproducibility
 
@@ -268,6 +292,25 @@ Both `_layer_norm_param_fwd_fused` and `_layer_norm_noparam_fwd_fused` need:
 
 And pass `M` from the Python callers (`triton_layernorm_param_forward`, `triton_layernorm_noparam_forward`).
 
+### 5. FlashInfer 0.6.7 API change
+
+**File**: `svg/kmeans_utils.py` (~line 1358)
+
+FlashInfer 0.6.7 removed `_vector_sparse_indptr_buffer` and `_vector_sparse_indices_buffer`
+from `VariableBlockSparseAttentionWrapper`. Remove the manual `reset_workspace_buffer` call:
+
+```diff
+ float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
+-vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
+ wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+-wrapper.reset_workspace_buffer(
+-    float_workspace_buffer=wrapper._float_workspace_buffer,
+-    int_workspace_buffer=wrapper._int_workspace_buffer,
+-    vector_sparse_indices_buffer=vector_sparse_indices_buffer,
+-    vector_sparse_indptr_buffer=wrapper._vector_sparse_indptr_buffer,
+-)
+```
+
 ### Summary
 
 | File | Change | Why |
@@ -275,9 +318,11 @@ And pass `M` from the Python callers (`triton_layernorm_param_forward`, `triton_
 | `svg/kernels/CMakeLists.txt` | `90a` → `100a` | Target B200 sm_100 |
 | `svg/models/wan/custom_models.py` | Handle tuple RoPE + de-interleave `[:, ::2]` | diffusers 0.37+ changed format |
 | `svg/kernels/triton/layernorm.py` | Add `row_mask = rows < M` to both kernels | Prevent illegal memory access |
+| `svg/kmeans_utils.py` | Remove `reset_workspace_buffer` with old buffer args | FlashInfer 0.6.7 API change |
 | pip: `diffusers` | `0.34.0` → `0.37.0` | transformers 5.x compatibility |
+| pip: `flashinfer-python` | `0.2.10` → `0.6.7` | Native Blackwell sm_100 JIT kernels |
 
-The FlashInfer patch (`assets/patches/modifications.patch`) is already in the repo — just needs to be applied to the submodule.
+With FlashInfer 0.6.7, the old `assets/patches/modifications.patch` is no longer needed.
 
 ## Adapting for your repository
 
